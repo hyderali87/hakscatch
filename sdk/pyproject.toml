@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "hakscatch-client"
+version = "0.1.0"
+description = "Small HTTP telemetry client for self-hosted hakscatch"
+requires-python = ">=3.10"
+license = "MIT"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hakscatch*"]

@@ -1,0 +1,46 @@
+name: hakscatch
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: hakscatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/setup.py first}
+      POSTGRES_DB: hakscatch
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hakscatch -d hakscatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://hakscatch:${POSTGRES_PASSWORD}@db:5432/hakscatch
+      HAKSCATCH_ADMIN_KEY: ${HAKSCATCH_ADMIN_KEY:?Run setup}
+      HAKSCATCH_INGEST_KEY: ${HAKSCATCH_INGEST_KEY:?Run setup}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      db: {condition: service_healthy}
+    restart: unless-stopped
+  web:
+    build: ./frontend
+    ports: ["127.0.0.1:8080:80"]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:0.6.8
+    profiles: [judge]
+    volumes: ["ollama:/root/.ollama"]
+    restart: unless-stopped
+volumes:
+  pgdata:
+  ollama:
