@@ -1,67 +1,3 @@
-import os, json, secrets, re
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Depends, Header, HTTPException, Query, Response, Request
-from fastapi.responses import JSONResponse
-import httpx
-from psycopg.types.json import Jsonb
-from psycopg.errors import ForeignKeyViolation
-from .db import pool, migrate
-from .models import Trace, Log, Metric, Baseline, Drift, JudgeResult
-from .evaluation import grounding, vector_drift, agent_drift
-
-ADMIN=os.getenv("HAKSCATCH_ADMIN_KEY", "")
-INGEST=os.getenv("HAKSCATCH_INGEST_KEY", "")
-@asynccontextmanager
-async def lifespan(app):
-    if len(ADMIN)<24 or len(INGEST)<24 or ADMIN==INGEST:
-        raise RuntimeError("Set distinct admin and ingest keys of at least 24 characters (scripts/setup.py)")
-    pool.open(); pool.wait(); migrate()
-    yield
-    pool.close()
-app=FastAPI(title="hakscatch API",version="0.1.0",lifespan=lifespan)
-
-def admin(x_api_key: str = Header(default="")):
-    if not secrets.compare_digest(x_api_key,ADMIN): raise HTTPException(401,"Invalid admin key")
-def writer(x_api_key: str = Header(default="")):
-    if not (secrets.compare_digest(x_api_key,INGEST) or secrets.compare_digest(x_api_key,ADMIN)):
-        raise HTTPException(401,"Invalid API key")
-
-@app.middleware("http")
-async def headers_and_size(request:Request,call_next):
-    if request.method in ("POST","PUT","PATCH"):
-        size=0;chunks=[]
-        async for chunk in request.stream():
-            size+=len(chunk)
-            if size>2_000_000:return JSONResponse({"detail":"Body exceeds 2 MB"},status_code=413)
-            chunks.append(chunk)
-        request._body=b"".join(chunks)
-    response=await call_next(request)
-    response.headers["X-Content-Type-Options"]="nosniff"
-    response.headers["Cache-Control"]="no-store"
-    return response
-
-def scrub(value):
-    # Basic defense only. Prefer removing personal information in the producer.
-    if isinstance(value,dict):return {k:("[REDACTED]" if re.search(r"password|secret|authorization|api.?key|access.?token",k,re.I) else scrub(v)) for k,v in value.items()}
-    if isinstance(value,list):return [scrub(v) for v in value]
-    if isinstance(value,str):
-        value=re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}","[EMAIL]",value)
-        return re.sub(r"(?i)bearer\s+[a-z0-9._~+/=-]+","Bearer [REDACTED]",value)
-    return value
-
-def cutoff(hours):return datetime.now(timezone.utc)-timedelta(hours=hours)
-def get_trace(c,id,project):
-    row=c.execute("SELECT * FROM traces WHERE id=%s AND project=%s",(id,project)).fetchone()
-    if not row:raise HTTPException(404,"Trace not found")
-    return row
-
-def save_eval(c,project,trace_id,kind,result):
-    return c.execute("INSERT INTO evaluations(project,trace_id,kind,result) VALUES (%s,%s,%s,%s) RETURNING *",(project,trace_id,kind,Jsonb(result))).fetchone()
-
-@app.get("/healthz")
-def health():
-    with pool.connection() as c:c.execute("SELECT 1")
     return {"status":"ok"}
 
 @app.post("/api/traces",dependencies=[Depends(writer)])
@@ -112,6 +48,24 @@ def metrics(project:str="default",hours:int=Query(24,ge=1,le=2160)):
     with pool.connection() as c:
         return c.execute("""SELECT name,unit,count(*) AS samples,avg(value) AS mean,min(value) AS min,max(value) AS max
         FROM metrics WHERE project=%s AND created_at>=%s GROUP BY name,unit ORDER BY name""",(project,cutoff(hours))).fetchall()
+
+@app.get("/api/projects", dependencies=[Depends(admin)])
+def list_projects():
+    """Discover stored projects across all record types, independent of time filters."""
+    with pool.connection() as c:
+        rows = c.execute("""
+            SELECT project FROM traces
+            UNION
+            SELECT project FROM logs
+            UNION
+            SELECT project FROM metrics
+            UNION
+            SELECT project FROM evaluations
+            UNION
+            SELECT project FROM baselines
+            ORDER BY project
+        """).fetchall()
+    return [row["project"] for row in rows]
 
 @app.get("/api/overview",dependencies=[Depends(admin)])
 def overview(project:str="default",hours:int=Query(24,ge=1,le=2160)):
@@ -172,5 +126,3 @@ def drift(data:Drift):
             try:result=vector_drift(p['vectors'],data.vectors,data.threshold)
             except ValueError as exc:raise HTTPException(422,str(exc))
         else:result=agent_drift(p['tool_sequences'],data.tool_sequences,data.threshold)
-        result.update(baseline_id=data.baseline_id,baseline_name=baseline['name'],sample_name=data.name)
-        return save_eval(c,data.project,None,data.kind+'_drift',result)
